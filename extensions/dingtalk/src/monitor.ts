@@ -168,6 +168,9 @@ export async function monitorDingtalkProvider(opts: MonitorDingtalkOpts = {}): P
           const client = createDingtalkClientFromConfig(dingtalkCfg);
           currentClient = client;
 
+          // 开启 SDK 调试模式以便分析连接状态
+          (client as any).debug = true;
+
           const cleanup = () => {
             if (healthCheckTimer) {
               clearInterval(healthCheckTimer);
@@ -212,15 +215,27 @@ export async function monitorDingtalkProvider(opts: MonitorDingtalkOpts = {}): P
 
           abortSignal?.addEventListener("abort", handleAbort, { once: true });
 
+          // 监听 SDK 底层连接事件，实现状态联动
+          client.on("close", () => {
+            finalizeReject(new Error("Stream connection closed by SDK"));
+          });
+
+          // 最后的防线：如果 SDK 自己也死透了（比如不触发 close，不触发心跳）
+          // 我们设置一个较宽松的阈值（5分钟），处理极端 hang 死
           healthCheckTimer = setInterval(() => {
             const idleTime = Date.now() - lastActivityAt;
-            if (idleTime > 90000) {
-              logger.error(`Stream connection idle for ${Math.round(idleTime / 1000)}s, forcing reconnect...`);
-              finalizeReject(new Error("Stream connection hung (idle timeout)"));
+            if (idleTime > 300000) { 
+              logger.error(`Stream connection absolute hang detected (${Math.round(idleTime / 1000)}s), forcing cleanup...`);
+              finalizeReject(new Error("Stream connection absolute hang"));
             }
-          }, 30000);
+          }, 60000); 
 
           try {
+            // 监听所有下行消息（包括系统心跳 KEEPALIVE）
+            client.on("message", () => {
+              lastActivityAt = Date.now();
+            });
+
             client.registerCallbackListener(TOPIC_ROBOT, (res) => {
               lastActivityAt = Date.now();
               const streamMessageId = res?.headers?.messageId;
